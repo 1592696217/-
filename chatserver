@@ -1,0 +1,301 @@
+from socket import *
+import sys
+from threading import Thread,Lock
+from settings import *
+from socketserver import *
+import time,pymysql,random,struct,hashlib,base64,requests
+
+class Server(ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    def __init__(self, server_address, RequestHandlerClass):
+        """Set up an initially empty mapping between a user' s nickname
+        and the file-like object used to send data to that user."""
+        ThreadingTCPServer.__init__(self, server_address, RequestHandlerClass)
+
+# class ChatServer(object):
+#     def __init__(self,address):
+#         self.address=address
+#         self.create_socket()
+#         self.client={}
+#         self.db=pymysql.connect(host='localhost',user='root',passwd='123456',db='chat',charset='utf8')
+
+#     def create_socket(self):
+#         self.sockfd=socket()
+#         self.sockfd.setsockopt(SOL_SOCKET,SO_REUSEADDR,1)
+#         self.ip=self.address[0]
+#         self.port=self.address[1]
+#         self.sockfd.bind(self.address)
+
+#     def serve_forever(self):
+#         self.sockfd.listen(10)
+#         print("Listen the port %d..."%self.port)
+#         while True:
+#             connfd,addr=self.sockfd.accept()
+#             print("Connect from",addr)
+#             handle_client=Thread(target=self.handle,args=(connfd,))
+#             handle_client.setDaemon(True)
+#             handle_client.start()
+
+class Handler(StreamRequestHandler):
+    client={}
+    db=pymysql.connect(host='localhost',user='root',passwd='123456',db='chat',charset='utf8')
+
+    def parse_recv_data(self,msg):
+        en_bytes=b''
+        cn_bytes=[]
+        if len(msg)<6:
+            return ''
+        v=msg[1]&0x7f
+        if v==0x7e:
+            p=4
+        elif v==0x7f:
+            p=10
+        else:
+            p=2
+        mask=msg[p:p+4]
+        data=msg[p+4:]
+        for k, v in enumerate(data):
+            nv=chr(v^mask[k%4])
+            nv_bytes=nv.encode()
+            nv_len=len(nv_bytes)
+            if nv_len==1:
+                en_bytes+=nv_bytes
+            else:
+                en_bytes+=b'%s'
+                cn_bytes.append(ord(nv_bytes.decode()))
+        if len(cn_bytes)>2:
+            # 字节数组转汉字
+            cn_str=''
+            clen=len(cn_bytes)
+            count=int(clen/3)
+            for x in range(0, count):
+                i=x*3
+                b=bytes([cn_bytes[i],cn_bytes[i + 1],cn_bytes[i + 2]])
+                cn_str+=b.decode()
+            new=en_bytes.replace(b'%s%s%s', b'%s')
+            new=new.decode()
+            res=(new % tuple(list(cn_str)))
+        else:
+            res=en_bytes.decode()
+        return res
+
+    def parse_send_data(self,data):
+        if data:
+            data=str(data)
+        else:
+            return False
+        token=b"\x81"
+        length=len(data.encode('utf-8'))
+        if length<126:
+            token+=struct.pack("B",length)
+        elif length<=0xFFFF:
+            token+=struct.pack("!BH",126, length)
+        else:
+            token+=struct.pack("!BQ",127,length)
+        data=b'%s%s'%(token, data.encode('utf-8'))
+        return data
+
+    def do_register(self,c,db,data):
+        l=data.split(' ')
+        name=l[1]
+        passwd=l[2]
+        cursor=db.cursor()
+        while True:
+            userID=''.join(random.sample("1234567890",8))
+            sql="select * from users where UID='%s'"%userID
+            cursor.execute(sql)
+            r=cursor.fetchone()
+            if r==None:
+                break
+        sql="insert into users(UID,username,password,online) values('%s','%s','%s','%s');"%(userID,name,passwd,'0')
+        try:
+            cursor.execute(sql)
+            db.commit()
+            msg=self.parse_send_data(userID)
+            c.send(msg)
+        except Exception as e:
+            print(e)
+            db.rollback()
+            msg=self.parse_send_data('注册失败')
+            c.send(msg)
+
+    def do_login(self,c,d,db,data):
+        l=data.split(' ')
+        userID=l[1]
+        passwd=l[2]
+        cursor=db.cursor()
+        sql="select * from users where UID='%s' and password='%s'"%(userID,passwd)
+        cursor.execute(sql)
+        r=cursor.fetchone()
+        if r==None:
+            msg=self.parse_send_data('输入的用户id不存在')
+            c.send(msg)
+        else:
+            sql="update users set online='1' where UID='%s'"%userID
+            try:
+                cursor.execute(sql)
+                db.commit()
+            except Exception as e:
+                print(e)
+                db.rollback()
+            d[userID]=c
+            print(d)
+            msg=self.parse_send_data('登录成功')
+            c.send(msg)
+        return userID
+
+    def make_friends(self,c,d,db,data):
+        l=data.split(' ')
+        friendID=l[1]
+        for k,v in d.items():
+            if c==v:
+                userID=k
+        # if not userID:
+        #     msg=self.parse_send_data('请先登录')
+        #     c.send(msg)
+        #     return
+        cursor=db.cursor()
+        sql3="select * from friends where UID='%s' and FID='%s'"%(userID,friendID)
+        cursor.execute(sql3)
+        r3=cursor.fetchone()
+        if r3!=None:
+            msg=self.parse_send_data('该好友已存在于好友列表中')
+            c.send(msg)
+            return
+        sql="select * from users where UID='%s' and online='%s'"%(friendID,'1')
+        cursor.execute(sql)
+        r=cursor.fetchone()
+        if r==None:
+            msg=self.parse_send_data('好友不在线')
+            c.send(msg)
+            return
+        else:
+            sql="insert into friends(UID,FID,friendship) values('%s','%s','%s')"%(userID,friendID,'1')
+            try:
+                cursor.execute(sql)
+                db.commit()
+            except Exception as e:
+                print(e)
+                db.rollback()
+                msg=self.parse_send_data('添加好友失败')
+                c.send(msg)
+                return
+        sql1="select UID,username from users where UID='%s'"%(userID)
+        cursor.execute(sql1)
+        r1=cursor.fetchone()
+        data1=' '.join(r1)
+        msg1=self.parse_send_data(data1)
+        d[friendID].send(msg1)
+        data2=d[friendID].recv(4096)
+        data2=self.parse_recv_data(data2)
+        if data2=='OK':
+            sql2="insert into friends(UID,FID,friendship) values('%s','%s','%s')"%(friendID,userID,'1')
+            try:
+                cursor.execute(sql2)
+                db.commit()
+            except Exception as e:
+                print(e)
+                db.rollback()
+                msg=self.parse_send_data('添加好友失败')
+                c.send(msg)
+            print(userID,d[userID])
+            msg=self.parse_send_data('添加好友成功')
+            d[userID].send(msg)
+        else:
+            msg=self.parse_send_data('好友申请没有通过')
+            c.send(msg)
+
+    def friend_chat(self,c,d,db,data):
+        l=data.split(' ')
+        friendID=l[1]
+        for k,v in d.items():
+            if c==v:
+                userID=k
+        cursor=db.cursor()
+        data1=self.parse_send_data('进入双人聊天模式')
+        c.send(data1)
+        d[friendID].send(data1)
+        data2=b""
+        while True:
+            while True:
+                time.sleep(0.2)
+                msg=c.recv(4096)
+                data2+=msg
+                if not data2:
+                    break
+                msg2=self.parse_recv_data(data2)
+                msg3=self.parse_send_data(msg2)
+                d[friendID].send(msg3)
+            if msg2=='##':
+                break
+            
+
+    def do_logout(self,c,db):
+        pass
+
+    def AI_Talk(self,c):
+        msg=self.parse_send_data("欢迎进入机器人自动聊天")
+        c.send(msg)
+        while True:
+            data=c.recv(4096)
+            data=self.parse_recv_data(data)
+            if data[0]=='Q':
+                break
+            s=self.parse_recv_data(data)
+            response=requests.post("http://www.tuling123.com/openapi/api",data={
+                "key":"5634ff292625426385690a8878f78879",
+                "info":s,
+                "userid":"351133"
+                })
+            m=self.parse_send_data(response.json()['text'])
+            c.send(m)
+
+    def handle(self):
+        print("Connect from",self.client_address)
+        requestData=self.request.recv(4096).decode()
+        if not requestData:
+            connfd.close()
+            return
+        requestLine=requestData.splitlines()
+        Sec_WebSocket_Key=requestLine[11].split(":")[1].strip()+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+        response_key = base64.b64encode(hashlib.sha1(bytes(Sec_WebSocket_Key, encoding="utf8")).digest())
+        response_key_str = str(response_key)
+        response_key_str = response_key_str[2:30]
+        response_key_entity = "Sec-WebSocket-Accept: " + response_key_str +"\r\n"
+        self.request.send(bytes("HTTP/1.1 101 Web Socket Protocol Handshake\r\n", encoding="utf8"))
+        self.request.send(bytes("Upgrade: websocket\r\n", encoding="utf8"))
+        self.request.send(bytes(response_key_entity, encoding="utf8"))
+        self.request.send(bytes("Connection: Upgrade\r\n\r\n", encoding="utf8"))
+        while True:
+            data=self.request.recv(4096)
+            data=self.parse_recv_data(data)
+            if data[0]=='E':
+                self.request.close()
+                sys.exit()
+            elif data[0]=='R':
+                self.do_register(self.request,Handler.db,data)
+            elif data[0]=='L':
+                userID=self.do_login(self.request,Handler.client,Handler.db,data)
+                sql="select UID,username from users where UID=(select FID from friends where UID='%s');"%userID
+                cursor=self.db.cursor()
+                cursor.execute(sql)
+                while True:
+                    time.sleep(1)
+                    r=cursor.fetchone()
+                    if r==None:
+                        break
+                    res='X '+r[0]+' '+r[1]
+                    msg=self.parse_send_data(res)
+                    self.request.send(msg)
+            elif data[0]=='F':
+                self.make_friends(self.request,Handler.client,Handler.db,data)
+            elif data[0]=='C':
+                self.friend_chat(self.request,Handler.client,Handler.db,data)
+            elif data[0]=='A':
+                self.AI_Talk(self.request)
+
+
+if __name__=='__main__':
+    server=Server(ADDR,Handler)
+    server.serve_forever()
